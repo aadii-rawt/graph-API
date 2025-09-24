@@ -17,11 +17,10 @@ const {
   CAROUSEL_IMAGE_URL = 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSc7W0Q9VBl3M1sy3m1JyNAskLGHmsLb9iyRA&s',
   IG_BUSINESS_ID,
   IG_USERNAME,
-  SIG_DEBUG = '0',
-  TEMP_DISABLE_SIG = '0'
+  SIG_DEBUG = '0'
 } = process.env;
 
-/* ---------- allow all origins (no cors lib) ---------- */
+/* ------------ allow all origins (no CORS lib) ------------ */
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -34,10 +33,10 @@ app.use('/health', express.json());
 app.use('/privacy-policy', express.json());
 app.use(morgan('tiny'));
 
-/* ---------- Root page (avoid 404 on /) ---------- */
+/* ------------ Root page ------------ */
 app.get('/', (_req, res) => res.type('html').send(helloHTML('GET')));
 
-/* ---------- (Optional) detect own IG username ---------- */
+/* ------------ Optional: detect our own IG username ------------ */
 let SELF_USERNAME = IG_USERNAME || null;
 (async () => {
   try {
@@ -53,10 +52,10 @@ let SELF_USERNAME = IG_USERNAME || null;
   } catch (_) {}
 })();
 
-/* ---------- Health ---------- */
+/* ------------ Health ------------ */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-/* ---------- Webhook verification (GET) ---------- */
+/* ------------ Webhook verification (GET) ------------ */
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -68,17 +67,10 @@ app.get('/webhook', (req, res) => {
   return res.type('html').send(helloHTML('GET'));
 });
 
-/* ---------- Webhook receiver (POST) ---------- */
-/* Use raw body so HMAC signature matches exactly */
+/* ------------ Webhook receiver (POST) ------------ */
+/* Use raw body so signature HMAC matches exactly */
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
-    if (TEMP_DISABLE_SIG === '1') {
-      if (SIG_DEBUG === '1') console.log('⚠️ TEMP_DISABLE_SIG=1 — skipping signature verification');
-      res.status(200).send(helloHTML('POST'));
-      safeProcessWebhook(req);
-      return;
-    }
-
     const sig256 = req.get('x-hub-signature-256');
     const sig1 = req.get('x-hub-signature');
     const headerSig = sig256 || sig1;
@@ -101,10 +93,10 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   }
 });
 
-/* ---------- Privacy ---------- */
+/* ------------ Privacy ------------ */
 app.get('/privacy-policy', (_req, res) => res.type('html').send(privacyHTML()));
 
-/* ---------- Start ---------- */
+/* ------------ Start ------------ */
 app.listen(PORT, () => console.log(`🚀 http://localhost:${PORT}`));
 
 /* ================= Helpers ================= */
@@ -128,35 +120,64 @@ async function processPayload(rawBuf) {
 
   for (const entry of body.entry) {
     for (const change of entry.changes || []) {
-      /* ----- New comment: private reply (top-level), else public reply ----- */
+      /* ----- New comment: fetch details, log, private reply to TOP-LEVEL ----- */
       if (change.field === 'comments' && change.value?.id) {
         const commentId = change.value.id;
 
+        // 1) Get comment details & log
+        let info = null;
+        try {
+          const { data } = await axios.get(
+            `https://graph.facebook.com/v23.0/${commentId}`,
+            { params: { fields: 'id,username,text,parent_id,media{id,caption}', access_token: PAGE_ACCESS_TOKEN } }
+          );
+          info = data || {};
+          console.log('📝 Comment detail:', JSON.stringify(info));
+        } catch (err) {
+          console.error('Read comment failed:', errMessage(err));
+        }
+
+        // 2) Optional: Business Discovery (logs only, not for DM)
+        if (IG_BUSINESS_ID && info?.username) {
+          try {
+            const { data } = await axios.get(
+              `https://graph.facebook.com/v23.0/${IG_BUSINESS_ID}`,
+              {
+                params: {
+                  fields: `business_discovery.username(${info.username}){id,username,name,profile_picture_url,ig_id,biography,followers_count,media_count,is_private}`,
+                  access_token: PAGE_ACCESS_TOKEN
+                }
+              }
+            );
+            console.log('🔎 BD result:', JSON.stringify(data?.business_discovery || data));
+          } catch (e) {
+            console.log('BD lookup skipped/failed (private or not business/creator).');
+          }
+        }
+
+        // 3) Private reply to TOP-LEVEL; if it fails, we stop (you cannot DM yet)
         try {
           await sendPrivateReplySmart(commentId, AUTO_REPLY_MESSAGE);
           console.log('✉️ Private reply sent for', commentId);
         } catch (err) {
-          console.error('Private reply failed (will fall back to public):', errMessage(err));
-          try {
-            await sendPublicReply(commentId, AUTO_REPLY_MESSAGE);
-            console.log('💬 Public reply posted to', commentId);
-          } catch (e2) {
-            console.error('Public reply also failed:', errMessage(e2));
-          }
+          console.error('Private reply failed:', errMessage(err));
         }
+
+        // Note: We DO NOT send DM here because we do NOT have the IGSID yet.
+        // DM will be sent when the user replies in DM (messages webhook below).
       }
 
-      /* ----- Incoming DM: send carousel (requires IGSID) ----- */
+      /* ----- Incoming DM: now we have IGSID, send carousel ----- */
       if (change.field === 'messages') {
         const msgs = change.value?.messages || [];
         for (const m of msgs) {
-          const fromId = m?.from?.id;                   // <-- IGSID (recipient id for /me/messages)
-          const text = (m?.text || '').trim().toLowerCase();
-
-          // ignore our own messages
+          const fromId = m?.from?.id;                   // <-- IGSID (required)
+          const text = (m?.text || '').trim();
           if (fromId && IG_BUSINESS_ID && String(fromId) === String(IG_BUSINESS_ID)) continue;
 
-          if (fromId && (text || m?.attachments)) {
+          console.log('📨 DM received:', { fromId, text });
+
+          if (fromId) {
             try {
               await sendCarousel(fromId);
               console.log('🧾 Carousel sent to', fromId);
@@ -167,15 +188,6 @@ async function processPayload(rawBuf) {
         }
       }
     }
-  }
-}
-
-function safeProcessWebhook(req) {
-  try {
-    const buf = req.body instanceof Buffer ? req.body : Buffer.from(req.body || '');
-    processPayload(buf);
-  } catch (e) {
-    console.error('safeProcessWebhook error:', e);
   }
 }
 
@@ -191,13 +203,6 @@ async function sendPrivateReplySmart(commentId, message) {
 
   // 2) Send private reply
   const url = `https://graph.facebook.com/v23.0/${targetId}/private_replies`;
-  const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
-  await axios.post(url, body.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-}
-
-/** Public reply (allowed on your own media) */
-async function sendPublicReply(commentId, message) {
-  const url = `https://graph.facebook.com/v23.0/${commentId}/replies`;
   const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
   await axios.post(url, body.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
 }
