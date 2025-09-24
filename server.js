@@ -1,8 +1,7 @@
-// server.js
 const express = require('express');
-const morgan  = require('morgan');
-const crypto  = require('crypto');
-const axios   = require('axios');
+const morgan = require('morgan');
+const crypto = require('crypto');
+const fetch = require('node-fetch'); // v2
 require('dotenv').config();
 
 const app = express();
@@ -13,15 +12,14 @@ const {
   VERIFY_TOKEN,
   APP_SECRET,
   PAGE_ACCESS_TOKEN,
-  AUTO_REPLY_MESSAGE = 'Thanks for the comment! Reply VIEW to get our catalog. Or visit https://aditya.dotdazzle.in',
-  CATALOG_URL = 'https://aditya.dotdazzle.in',
-  CAROUSEL_IMAGE_URL = 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSc7W0Q9VBl3M1sy3m1JyNAskLGHmsLb9iyRA&s',
+  AUTO_REPLY_MESSAGE = 'Thanks for the comment! 🙌',
   IG_BUSINESS_ID,
-  IG_USERNAME,
+  IG_USERNAME,                   // optional shortcut
   SIG_DEBUG = '0',
+  TEMP_DISABLE_SIG = '0',
 } = process.env;
 
-/* ----------------- open CORS for convenience ----------------- */
+// allow all origins (helpful for your tests; not needed for Meta)
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -30,203 +28,223 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use('/health', express.json());
+app.use('/privacy-policy', express.json());
 app.use(morgan('tiny'));
 
-/* ----------------- simple pages ----------------- */
-app.get('/', (_req, res) => res.type('html').send(helloHTML('GET')));
-app.get('/health', (_req, res) => res.json({ ok: true }));
-app.get('/privacy-policy', (_req, res) => res.type('html').send(privacyHTML()));
+// in-memory de-dupe of comment ids (avoid double replies on retries)
+const seenCommentIds = new Set();
 
-/* ----------------- webhook verify (GET) ----------------- */
+// resolve our own IG username (to avoid replying to ourselves)
+let SELF_USERNAME = IG_USERNAME || null;
+(async () => {
+  try {
+    if (!SELF_USERNAME && IG_BUSINESS_ID && PAGE_ACCESS_TOKEN) {
+      const r = await fetch(`https://graph.facebook.com/v23.0/${IG_BUSINESS_ID}?fields=username&access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`);
+      if (r.ok) {
+        const j = await r.json();
+        if (j.username) {
+          SELF_USERNAME = String(j.username);
+          console.log('👤 Detected IG username:', SELF_USERNAME);
+        }
+      }
+    }
+  } catch (_) {}
+})();
+
+// health
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// GET /webhook (Meta verify or friendly page)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+
   if (mode === 'subscribe' && token === VERIFY_TOKEN && challenge) {
+    console.log('✅ Webhook verified');
     return res.status(200).send(challenge);
   }
-  return res.sendStatus(403);
+  return res.type('html').send(HELLO_HTML('GET'));
 });
 
-/* ----------------- webhook receive (POST) ----------------- */
-/* IMPORTANT: raw body here to match Meta signature exactly.  */
-/* Put this route BEFORE any json/body parser.                */
+// POST /webhook — use raw body so HMAC matches exactly
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
-  const headerSig = req.get('x-hub-signature-256') || req.get('x-hub-signature');
-  const rawBuf    = req.body instanceof Buffer ? req.body : Buffer.from(req.body || '');
-
-  // verify signature
-  if (!verifySig(headerSig, rawBuf, APP_SECRET)) {
-    if (SIG_DEBUG === '1') {
-      const [algo='sha256', their=''] = (headerSig || '').split('=');
-      const ours = computeHmac(algo, rawBuf, APP_SECRET);
-      console.log('SigDebug:', { algo, len: rawBuf.length, valid: false },
-        '\n  header:', headerSig,
-        '\n  ours  :', `${algo}=${ours}`,
-        '\n  body  :', rawBuf.toString('utf8').slice(0, 160).replace(/\s+/g, ' ')
-      );
+  try {
+    if (TEMP_DISABLE_SIG === '1') {
+      if (SIG_DEBUG === '1') console.log('⚠️ TEMP_DISABLE_SIG=1 — skipping signature verification');
+      res.status(200).send(HELLO_HTML('POST'));
+      safeProcessWebhook(req);
+      return;
     }
-    return res.sendStatus(401);
+
+    const sig256 = req.get('x-hub-signature-256');
+    const sig1 = req.get('x-hub-signature');
+    const headerSig = sig256 || sig1;
+    const rawBuf = req.body instanceof Buffer ? req.body : Buffer.from(req.body || '');
+    const valid = verifyMetaSignature(headerSig, rawBuf, APP_SECRET);
+
+    if (SIG_DEBUG === '1') {
+      const sample = rawBuf.toString('utf8').slice(0, 80).replace(/\s+/g, ' ');
+      console.log('🔎 SigDebug ->', {
+        algo: headerSig ? headerSig.split('=')[0] : 'none',
+        rawLen: rawBuf.length,
+        valid
+      });
+      console.log('🔎 BodySample:', sample);
+    }
+
+    if (!APP_SECRET || !valid) {
+      console.warn('❌ Invalid or missing signature on webhook POST');
+      return res.sendStatus(401);
+    }
+
+    // Ack fast
+    res.sendStatus(200);
+
+    // Process after ack
+    await processWebhookBuffer(rawBuf);
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+    try { res.sendStatus(200); } catch {}
   }
+});
 
-  // dedupe exact retries by hashing the raw body
-  if (isDuplicateDelivery(rawBuf)) {
-    if (SIG_DEBUG === '1') console.log('🔁 duplicate delivery skipped');
-    return res.sendStatus(200);
+// Privacy Policy page
+app.get('/privacy-policy', (_req, res) => {
+  res.type('html').send(PRIVACY_POLICY_HTML());
+});
+
+// start
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
+
+// ================= Helpers =================
+function verifyMetaSignature(headerSig, rawBodyBuf, appSecret) {
+  if (!appSecret || !headerSig || !rawBodyBuf) return false;
+  const parts = headerSig.split('=');
+  if (parts.length !== 2) return false;
+  const algo = parts[0]; // sha256 or sha1
+  const theirHex = parts[1];
+
+  let hmacHex;
+  try {
+    hmacHex = crypto.createHmac(algo, appSecret).update(rawBodyBuf).digest('hex');
+  } catch {
+    hmacHex = crypto.createHmac('sha256', appSecret).update(rawBodyBuf).digest('hex');
   }
+  try {
+    return crypto.timingSafeEqual(Buffer.from(theirHex), Buffer.from(hmacHex));
+  } catch {
+    return false;
+  }
+}
 
-  res.sendStatus(200); // ack fast
-
-  // handle payload
-  let body; try { body = JSON.parse(rawBuf.toString('utf8')); } catch { return; }
+async function processWebhookBuffer(rawBuf) {
+  let body;
+  try {
+    body = JSON.parse(rawBuf.toString('utf8'));
+  } catch (e) {
+    console.error('⚠️ Could not parse JSON body:', e?.message);
+    return;
+  }
   if (!body?.object || !Array.isArray(body.entry)) return;
 
   for (const entry of body.entry) {
-    for (const change of entry.changes ?? []) {
-      /* ===== comments ===== */
+    for (const change of entry.changes || []) {
       if (change.field === 'comments' && change.value?.id) {
         const commentId = change.value.id;
-
-        // extra dedupe by comment id (Meta may re-send)
+        // skip duplicates
         if (seenCommentIds.has(commentId)) {
-          if (SIG_DEBUG === '1') console.log('↩️ already processed comment', commentId);
+          if (SIG_DEBUG === '1') console.log('↩️ already handled', commentId);
           continue;
         }
         seenCommentIds.add(commentId);
-        pruneSeen();
 
-        // 1) fetch + log details (who commented, text, parent/top-level, media)
-        try {
-          const { data } = await axios.get(
-            `https://graph.facebook.com/v23.0/${commentId}`,
-            { params: { fields: 'id,username,text,parent_id,media{id,caption}', access_token: PAGE_ACCESS_TOKEN } }
-          );
-          console.log('📝 Comment detail:', data);
-        } catch (e) {
-          console.error('Read comment failed:', apiErr(e));
+        // who wrote it? (avoid replying to ourselves)
+        let author = change.value.username || null;
+        if (!author) {
+          try {
+            const r = await fetch(`https://graph.facebook.com/v23.0/${commentId}?fields=username&access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`);
+            if (r.ok) {
+              const j = await r.json();
+              author = j.username || null;
+            }
+          } catch (_) {}
+        }
+        if (author && SELF_USERNAME && author.toLowerCase() === SELF_USERNAME.toLowerCase()) {
+          if (SIG_DEBUG === '1') console.log('🛑 own comment; skipping reply');
+          continue;
         }
 
-        // 2) private reply to TOP-LEVEL (parent if present) — prompts them to DM
+        const text = change.value?.text;
+        console.log('📝 New comment:', { commentId, author, text });
+
+        // === PUBLIC REPLY ===
         try {
-          await sendPrivateReplySmart(commentId, AUTO_REPLY_MESSAGE);
-          console.log('✉️ Private reply sent for', commentId);
-        } catch (e) {
-          console.error('Private reply failed:', apiErr(e));
+          await sendPublicReply(commentId, AUTO_REPLY_MESSAGE);
+          console.log('💬 Public reply posted to', commentId);
+        } catch (err) {
+          console.error('Public reply failed:', await safeText(err));
         }
+
+        // If you ALSO want a private reply DM, uncomment:
+        // try {
+        //   await sendPrivateReply(commentId, 'Thanks! I just DMed you details. ✉️');
+        // } catch (err) { console.error('Private reply failed:', await safeText(err)); }
       }
 
-      /* ===== messages (DM) ===== */
+      // (Optional) handle DMs if you subscribed to messages
       if (change.field === 'messages') {
-        const msgs = change.value?.messages || [];
-        for (const m of msgs) {
-          const fromId = m?.from?.id;  // <-- IGSID needed to DM
-          if (!fromId) continue;
-          if (IG_BUSINESS_ID && String(fromId) === String(IG_BUSINESS_ID)) continue; // ignore ourselves
-
-          console.log('📨 DM received:', { fromId, text: (m?.text || '').trim() });
-
-          try {
-            await sendCarousel(fromId);
-            console.log('🧾 Carousel sent to', fromId);
-          } catch (e) {
-            console.error('Send carousel failed:', apiErr(e));
-          }
-        }
+        console.log('📨 DM event:', JSON.stringify(change.value));
       }
     }
   }
-});
-
-/* ----------------- start ----------------- */
-app.listen(PORT, () => console.log(`🚀 http://localhost:${PORT}`));
-
-/* ================= helpers ================= */
-function computeHmac(algo, buf, secret) {
-  try { return crypto.createHmac(algo, secret).update(buf).digest('hex'); }
-  catch { return crypto.createHmac('sha256', secret).update(buf).digest('hex'); }
-}
-function verifySig(headerSig, raw, secret) {
-  if (!secret || !headerSig || !raw) return false;
-  const [algo, theirHex] = headerSig.split('=');
-  if (!algo || !theirHex) return false;
-  const ourHex = computeHmac(algo, raw, secret);
-  try { return crypto.timingSafeEqual(Buffer.from(theirHex), Buffer.from(ourHex)); }
-  catch { return false; }
 }
 
-/* -- dedupe (raw body) -- */
-const seenDeliveries = new Map(); // hash -> ts
-function isDuplicateDelivery(rawBuf) {
-  const key = crypto.createHash('sha256').update(rawBuf).digest('hex');
-  const now = Date.now();
-  if (seenDeliveries.has(key)) return true;
-  seenDeliveries.set(key, now);
-  // prune old (>10 min)
-  for (const [k, t] of seenDeliveries) if (now - t > 10 * 60 * 1000) seenDeliveries.delete(k);
-  return false;
-}
-/* -- extra dedupe per comment id -- */
-const seenCommentIds = new Set();
-function pruneSeen() {
-  // lightweight: clear set if it grows too big
-  if (seenCommentIds.size > 2000) seenCommentIds.clear();
+function safeProcessWebhook(req) {
+  try {
+    const buf = req.body instanceof Buffer ? req.body : Buffer.from(req.body || '');
+    processWebhookBuffer(buf);
+  } catch (e) {
+    console.error('safeProcessWebhook error:', e);
+  }
 }
 
-async function sendPrivateReplySmart(commentId, message) {
-  // reply to top-level
-  let targetId = commentId;
-  const { data } = await axios.get(
-    `https://graph.facebook.com/v23.0/${commentId}`,
-    { params: { fields: 'id,parent_id', access_token: PAGE_ACCESS_TOKEN } }
-  );
-  if (data?.parent_id) targetId = data.parent_id;
-
-  const url  = `https://graph.facebook.com/v23.0/${targetId}/private_replies`;
-  const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
-  await axios.post(url, body.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+async function sendPublicReply(commentId, message) {
+  // POST /{ig-comment-id}/replies
+  const url = `https://graph.facebook.com/v23.0/${commentId}/replies`;
+  const params = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
+  const r = await fetch(url, { method: 'POST', body: params });
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} — ${await r.text()}`);
 }
 
-async function sendCarousel(igsid) {
-  const payload = {
-    recipient: { id: igsid },
-    messaging_type: 'RESPONSE',
-    message: {
-      attachment: {
-        type: 'template',
-        payload: {
-          template_type: 'generic',
-          elements: [{
-            title: 'Browse our products',
-            subtitle: 'Tap below to view the full catalog',
-            image_url: CAROUSEL_IMAGE_URL || CATALOG_URL,
-            default_action: { type: 'web_url', url: CATALOG_URL },
-            buttons: [{ type: 'web_url', url: CATALOG_URL, title: 'View all products' }]
-          }]
-        }
-      }
-    }
-  };
-  await axios.post('https://graph.facebook.com/v23.0/me/messages',
-    payload, { params: { access_token: PAGE_ACCESS_TOKEN } });
+async function sendPrivateReply(commentId, message) {
+  const url = `https://graph.facebook.com/v23.0/${commentId}/private_replies`;
+  const params = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
+  const r = await fetch(url, { method: 'POST', body: params });
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} — ${await r.text()}`);
 }
 
-function apiErr(err) {
-  if (err?.response) return `HTTP ${err.response.status} — ${JSON.stringify(err.response.data)}`;
-  return String(err?.message || err);
+async function safeText(err) {
+  try { return err?.stack?.toString() || String(err); } catch { return 'Unknown error'; }
 }
 
-function helloHTML(method) {
-  return `<!doctype html><html><head><meta charset="utf-8"/><title>${method}</title>
+function HELLO_HTML(method) {
+  return `<!doctype html><html><head><meta charset="utf-8"/><title>Webhook ${method}</title>
   <style>body{font-family:system-ui,Arial;padding:24px}</style></head>
   <body><h1>This is ${method} Request, Hello Webhook!</h1></body></html>`;
 }
-function privacyHTML() {
-  const d = new Date().toISOString().slice(0,10);
+
+function PRIVACY_POLICY_HTML() {
+  const today = new Date().toISOString().slice(0,10);
   return `<!doctype html><html><head><meta charset="utf-8"/><title>Privacy Policy</title>
-  <style>body{font-family:system-ui,Arial;padding:24px;line-height:1.6;max-width:860px;margin:auto}</style></head>
+  <style>body{font-family:system-ui,Arial;padding:24px;line-height:1.6}</style></head>
   <body><h1>Privacy Policy</h1>
-  <p>Effective date: <strong>${d}</strong></p>
-  <p>We use Instagram data you authorize to provide features such as private replies and catalogs.</p>
-  <p>We do not sell personal data. You may revoke permissions anytime in Instagram/Facebook settings.</p>
+  <p>Effective date: <strong>${today}</strong></p>
+  <p>We collect Instagram data (comments, messages, media metadata) you authorize.</p>
+  <p>We use it to send automated replies and provide services. We do not sell data.</p>
+  <p>You may revoke permissions anytime from Instagram/Facebook settings.</p>
   <p>Contact: contact@example.com</p></body></html>`;
 }
