@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const morgan = require('morgan');
 const crypto = require('crypto');
@@ -12,28 +11,35 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const APP_SECRET = process.env.APP_SECRET;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const AUTO_REPLY_MESSAGE =
-  process.env.AUTO_REPLY_MESSAGE || 'Thanks for your comment! 😊';
+  process.env.AUTO_REPLY_MESSAGE || 'Thanks for your comment! 🙌';
 
-// ---- allow ALL origins (no cors pkg) ----
+// --- allow ALL origins ---
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', req.header('Access-Control-Request-Headers') || '*');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    req.header('Access-Control-Request-Headers') || '*'
+  );
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// keep raw body for signature verification
-app.use(express.json({
-  verify: (req, _res, buf) => { req.rawBody = buf; }
-}));
+// keep raw body for signature validation
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+
 app.use(morgan('tiny'));
 
+// health check
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// === GET /webhook ===
-// - If Meta verification params are present: return hub.challenge (required)
-// - Otherwise: show a friendly HTML page like your screenshot
+// ========== GET /webhook ==========
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -44,36 +50,32 @@ app.get('/webhook', (req, res) => {
     return res.status(200).send(challenge);
   }
 
-  // No verification params -> show demo page
-  return res
-    .type('html')
-    .send(HELLO_HTML('GET'));
+  // show simple page if opened in browser
+  return res.type('html').send(HELLO_HTML('GET'));
 });
 
-// === POST /webhook ===
-// - For real webhook calls (Meta sets signature): verify & ack 200; process events
-// - For manual tests, call /webhook?test=1 and we’ll show the POST demo page
+// ========== POST /webhook ==========
 app.post('/webhook', async (req, res) => {
+  const isTest = req.query.test === '1';
+
   try {
-    const isTest = req.query.test === '1';
+    const sig256 = req.get('x-hub-signature-256');
+    const sig1 = req.get('x-hub-signature');
+    const headerSig = sig256 || sig1;
 
-    const sig = req.get('x-hub-signature-256');
-    const validSig = sig && isValidSignature(sig, req.rawBody, APP_SECRET);
-
+    // For Meta → verify signature
     if (!isTest) {
-      // production path: must have valid signature
-      if (!APP_SECRET || !validSig) {
+      if (!APP_SECRET || !verifyMetaSignature(headerSig, req.rawBody, APP_SECRET)) {
         console.warn('❌ Invalid or missing signature on webhook POST');
         return res.sendStatus(401);
       }
-      // ack fast
-      res.sendStatus(200);
+      res.sendStatus(200); // ack quickly
     } else {
-      // manual/browser test -> show the same kind of page
+      // test mode: show demo page
       return res.type('html').send(HELLO_HTML('POST'));
     }
 
-    // ----- process Meta payload (async, after ack) -----
+    // --- process real webhook payload ---
     const body = req.body;
     if (!body?.object || !Array.isArray(body.entry)) return;
 
@@ -86,7 +88,7 @@ app.post('/webhook', async (req, res) => {
 
           try {
             await sendPrivateReply(commentId, AUTO_REPLY_MESSAGE);
-            console.log('📩 Private reply sent for comment', commentId);
+            console.log('📩 Private reply sent');
           } catch (err) {
             console.error('Private reply failed:', await safeText(err));
           }
@@ -101,70 +103,62 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Simple privacy policy page
+// ========== Privacy Policy ==========
 app.get('/privacy-policy', (_req, res) => {
   res.type('html').send(PRIVACY_POLICY_HTML());
 });
 
+// start server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
 
 // ===== Helpers =====
-function isValidSignature(headerSig, rawBody, appSecret) {
-  if (!appSecret || !headerSig || !headerSig.startsWith('sha256=')) return false;
-  const their = headerSig.slice('sha256='.length);
-  const expected = crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
+function verifyMetaSignature(headerSig, rawBody, appSecret) {
+  if (!appSecret || !headerSig || !rawBody) return false;
+  const [algo, theirHex] = headerSig.split('=');
+  if (!algo || !theirHex) return false;
+  const hmac = crypto.createHmac(algo, appSecret).update(rawBody).digest('hex');
   try {
-    return crypto.timingSafeEqual(Buffer.from(their), Buffer.from(expected));
+    return crypto.timingSafeEqual(Buffer.from(theirHex), Buffer.from(hmac));
   } catch {
     return false;
   }
 }
 
 async function sendPrivateReply(commentId, message) {
-  // Allowed once per comment within 7 days (Meta policy)
   const url = `https://graph.facebook.com/v23.0/${commentId}/private_replies`;
-  const params = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
+  const params = new URLSearchParams({
+    message,
+    access_token: PAGE_ACCESS_TOKEN,
+  });
   const r = await fetch(url, { method: 'POST', body: params });
   if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} — ${await r.text()}`);
 }
 
 async function safeText(err) {
-  try { return err?.stack?.toString() || String(err); } catch { return 'Unknown error'; }
+  try {
+    return err?.stack?.toString() || String(err);
+  } catch {
+    return 'Unknown error';
+  }
 }
 
-// HTML used for your "Hello Webhook!" preview page
 function HELLO_HTML(method) {
   return `<!doctype html>
-<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Webhook ${method} Demo</title>
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px}
-  h1{font-size:28px;font-weight:600}
-</style>
-</head>
-<body>
-  <h1>This is ${method} Request, Hello Webhook!</h1>
-</body></html>`;
+<html><head><meta charset="utf-8"/><title>Webhook ${method}</title>
+<style>body{font-family:system-ui,Arial;padding:24px}</style></head>
+<body><h1>This is ${method} Request, Hello Webhook!</h1></body></html>`;
 }
 
 function PRIVACY_POLICY_HTML() {
-  const today = new Date().toISOString().slice(0,10);
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Privacy Policy</title>
-  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.6;padding:24px;max-width:860px;margin:auto;color:#111}
-  h1{font-size:28px;margin-bottom:8px}h2{margin-top:24px;font-size:20px}.muted{color:#555}a{color:#2563eb;text-decoration:none}code{background:#f5f5f5;padding:2px 6px;border-radius:4px}</style></head>
-  <body><h1>Privacy Policy</h1><p class="muted">Effective date: <strong>${today}</strong></p>
-  <p>We operate this Service and its Instagram integration.</p>
-  <h2>Information We Collect</h2><ul>
-  <li>Instagram data via Meta APIs (account ID, username, media metadata, comments, messages where authorized).</li>
-  <li>Technical data (IP, user agent, logs) for security and debugging.</li></ul>
-  <h2>How We Use Information</h2><ul>
-  <li>Provide features like comment notifications and one-time private replies.</li>
-  <li>Operate, secure, and improve the Service; comply with legal obligations.</li></ul>
-  <h2>Rights & Contact</h2>
-  <p>You may request access, correction, or deletion. Contact: <a href="mailto:contact@example.com">contact@example.com</a>.</p>
-  <p class="muted">Instagram/Meta are third-party services with their own policies.</p></body></html>`;
+  const today = new Date().toISOString().slice(0, 10);
+  return `<!doctype html><html><head><meta charset="utf-8"/><title>Privacy Policy</title>
+  <style>body{font-family:system-ui,Arial;padding:24px;line-height:1.6}</style></head>
+  <body><h1>Privacy Policy</h1>
+  <p>Effective date: <strong>${today}</strong></p>
+  <p>We collect Instagram data (comments, messages, media metadata) you authorize.</p>
+  <p>We use it to send automated replies and provide services. We do not sell data.</p>
+  <p>You may revoke permissions anytime from Instagram/Facebook settings.</p>
+  <p>Contact: contact@example.com</p></body></html>`;
 }
