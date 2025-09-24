@@ -18,10 +18,10 @@ const {
   IG_BUSINESS_ID,
   IG_USERNAME,
   SIG_DEBUG = '0',
-  TEMP_DISABLE_SIG = '0',
+  TEMP_DISABLE_SIG = '0'
 } = process.env;
 
-// ---- allow all origins (handy for manual checks) ----
+/* ---------- allow all origins (no cors lib) ---------- */
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -34,10 +34,10 @@ app.use('/health', express.json());
 app.use('/privacy-policy', express.json());
 app.use(morgan('tiny'));
 
-// Root page (avoid GET / 404)
+/* ---------- Root page (avoid 404 on /) ---------- */
 app.get('/', (_req, res) => res.type('html').send(helloHTML('GET')));
 
-// Optional: detect our own IG username (not required)
+/* ---------- (Optional) detect own IG username ---------- */
 let SELF_USERNAME = IG_USERNAME || null;
 (async () => {
   try {
@@ -53,10 +53,10 @@ let SELF_USERNAME = IG_USERNAME || null;
   } catch (_) {}
 })();
 
-// health
+/* ---------- Health ---------- */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// webhook verify
+/* ---------- Webhook verification (GET) ---------- */
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -68,11 +68,12 @@ app.get('/webhook', (req, res) => {
   return res.type('html').send(helloHTML('GET'));
 });
 
-// webhook receive (raw body for signature)
+/* ---------- Webhook receiver (POST) ---------- */
+/* Use raw body so HMAC signature matches exactly */
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     if (TEMP_DISABLE_SIG === '1') {
-      if (SIG_DEBUG === '1') console.log('⚠️ TEMP_DISABLE_SIG=1 — skipping signature');
+      if (SIG_DEBUG === '1') console.log('⚠️ TEMP_DISABLE_SIG=1 — skipping signature verification');
       res.status(200).send(helloHTML('POST'));
       safeProcessWebhook(req);
       return;
@@ -100,12 +101,14 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   }
 });
 
-// privacy
+/* ---------- Privacy ---------- */
 app.get('/privacy-policy', (_req, res) => res.type('html').send(privacyHTML()));
 
+/* ---------- Start ---------- */
 app.listen(PORT, () => console.log(`🚀 http://localhost:${PORT}`));
 
-// ===== helpers =====
+/* ================= Helpers ================= */
+
 function verifySig(headerSig, raw, secret) {
   if (!secret || !headerSig || !raw) return false;
   const [algo, theirs] = headerSig.split('=');
@@ -125,7 +128,7 @@ async function processPayload(rawBuf) {
 
   for (const entry of body.entry) {
     for (const change of entry.changes || []) {
-      // ----- New comment: try PRIVATE reply (top-level), else PUBLIC reply -----
+      /* ----- New comment: private reply (top-level), else public reply ----- */
       if (change.field === 'comments' && change.value?.id) {
         const commentId = change.value.id;
 
@@ -143,12 +146,14 @@ async function processPayload(rawBuf) {
         }
       }
 
-      // ----- Incoming DM: send the carousel -----
+      /* ----- Incoming DM: send carousel (requires IGSID) ----- */
       if (change.field === 'messages') {
         const msgs = change.value?.messages || [];
         for (const m of msgs) {
-          const fromId = m?.from?.id;
+          const fromId = m?.from?.id;                   // <-- IGSID (recipient id for /me/messages)
           const text = (m?.text || '').trim().toLowerCase();
+
+          // ignore our own messages
           if (fromId && IG_BUSINESS_ID && String(fromId) === String(IG_BUSINESS_ID)) continue;
 
           if (fromId && (text || m?.attachments)) {
@@ -174,34 +179,33 @@ function safeProcessWebhook(req) {
   }
 }
 
-/** Read a comment; if it's a reply, target the TOP-LEVEL comment for private_replies */
+/** Private reply to the TOP-LEVEL comment (parent_id when present) */
 async function sendPrivateReplySmart(commentId, message) {
+  // 1) Find parent_id; private reply must target the top-level comment
   let targetId = commentId;
-  // 1) Find parent_id (if present, we must private-reply on the parent/top-level)
   const { data } = await axios.get(
     `https://graph.facebook.com/v23.0/${commentId}`,
     { params: { fields: 'id,parent_id', access_token: PAGE_ACCESS_TOKEN } }
   );
   if (data?.parent_id) targetId = data.parent_id;
 
-  // 2) Private reply
+  // 2) Send private reply
   const url = `https://graph.facebook.com/v23.0/${targetId}/private_replies`;
   const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
   await axios.post(url, body.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
 }
 
-/** Public reply (always allowed on your own media) */
+/** Public reply (allowed on your own media) */
 async function sendPublicReply(commentId, message) {
-  // If it’s a reply, replying to the reply is fine publicly. If you want to always reply to top-level publicly:
-  // first read parent_id like in sendPrivateReplySmart and use parent if needed.
   const url = `https://graph.facebook.com/v23.0/${commentId}/replies`;
   const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
   await axios.post(url, body.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
 }
 
-async function sendCarousel(recipientId) {
+/** Send a 1-card carousel to an IGSID (from webhook messages[].from.id) */
+async function sendCarousel(igsid) {
   const payload = {
-    recipient: { id: recipientId },
+    recipient: { id: igsid },
     messaging_type: 'RESPONSE',
     message: {
       attachment: {
