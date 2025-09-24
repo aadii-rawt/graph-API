@@ -8,24 +8,23 @@ require('dotenv').config();
 const app = express();
 app.set('trust proxy', 1);
 
-/* =================== ENV =================== */
+/* =================== HARD-CODED IG (Basic Display) TOKEN =================== */
+/* Used ONLY for https://graph.instagram.com (Basic Display) endpoints */
+const IG_URL_ACCESS_TOKEN =
+  'IGAAVVFmqvs4JBZAE5SWVlOZAC10QWVHYlZAyNTNNc3dOS3VkcUxGMUFCdHpMQ2hOTF9mWnB5UWZAFT0FhZAUlBZA3FxRWc2U0U4Tl81VDZAudEdQelhBcUVIcUNoSGgzdzh6ZATJqaVRPSnpxTnBFQUxyNjFGM0NINnNqeW9zbHAxS0FuQQZDZD';
+
+/* =================== ENV (Graph API / messaging) =================== */
 const {
   PORT = 3000,
   VERIFY_TOKEN,
   APP_SECRET,
-  // Token used to read comment details and post private replies
-  PAGE_ACCESS_TOKEN,
-  // 🔑 Token used SPECIFICALLY to send DMs (another Page token you mentioned)
-  DM_PAGE_ACCESS_TOKEN,
-  // Messaging text
+  PAGE_ACCESS_TOKEN,          // read comments + private replies (graph.facebook.com)
+  DM_PAGE_ACCESS_TOKEN,       // send DMs (graph.facebook.com) — MUST be a Page token (EA…)
   DM_MESSAGE_TEXT = 'Thanks for your comment! Check our catalog: https://example.com',
   AUTO_REPLY_MESSAGE = 'Thanks for the comment! We just messaged you. ✉️',
-  SIG_DEBUG = '0',
+  SIG_DEBUG = '1',
+  TEMP_DISABLE_SIG = '0',
 } = process.env;
-
-if (!DM_PAGE_ACCESS_TOKEN) {
-  console.warn('⚠️  DM_PAGE_ACCESS_TOKEN not set — DM calls will fail.');
-}
 
 /* =================== Middleware =================== */
 app.use((req, res, next) => {
@@ -37,18 +36,50 @@ app.use((req, res, next) => {
 });
 app.use(morgan('tiny'));
 
-/* Keep /webhook raw & non-inflated so signature matches exactly */
+/* RAW parser just for the webhook route */
 const rawParser = express.raw({ type: '*/*', inflate: false, limit: '5mb' });
 
-/* =================== Health/Policy =================== */
+/* =================== Health + Privacy =================== */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/privacy-policy', (_req, res) => {
   res.type('html').send(`<!doctype html><html><body>
-  <h1>Privacy Policy</h1><p>We use Instagram data you authorize to provide automated replies and messages.</p>
+  <h1>Privacy Policy</h1>
+  <p>We use Instagram data you authorize to provide automated replies and messages.</p>
   </body></html>`);
 });
 
-/* =================== Verify (GET) =================== */
+/* =================== DEBUG routes using your IGA… token =================== */
+/* These hit graph.instagram.com with the HARD-CODED token. Good for quick tests. */
+app.get('/debug/basic-user', async (_req, res) => {
+  try {
+    const r = await axios.get('https://graph.instagram.com/v21.0/me', {
+      params: {
+        fields: 'id,username,account_type,media_count',
+        access_token: IG_URL_ACCESS_TOKEN
+      }
+    });
+    res.status(r.status).json(r.data);
+  } catch (e) {
+    res.status(e?.response?.status || 500).json(e?.response?.data || { error: String(e) });
+  }
+});
+
+app.get('/debug/basic-media', async (_req, res) => {
+  try {
+    const r = await axios.get('https://graph.instagram.com/v21.0/me/media', {
+      params: {
+        fields: 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp',
+        access_token: IG_URL_ACCESS_TOKEN,
+        limit: 25
+      }
+    });
+    res.status(r.status).json(r.data);
+  } catch (e) {
+    res.status(e?.response?.status || 500).json(e?.response?.data || { error: String(e) });
+  }
+});
+
+/* =================== Webhook verify (GET) =================== */
 app.get('/webhook', (req, res) => {
   const mode      = req.query['hub.mode'];
   const token     = req.query['hub.verify_token'];
@@ -57,70 +88,70 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-/* =================== Receive (POST) =================== */
+/* =================== Webhook receive (POST) =================== */
 app.post('/webhook', rawParser, async (req, res) => {
   try {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
-    const sig = (req.get('x-hub-signature-256') || req.get('x-hub-signature') || '').replace(/"/g, '');
+    const sigHeader = (req.get('x-hub-signature-256') || req.get('x-hub-signature') || '').replace(/"/g, '');
 
-    const valid = verifySig(sig, raw, (APP_SECRET || '').trim());
+    const { valid, ours256, ours1 } = verifyWithDebug(sigHeader, raw, (APP_SECRET || '').trim());
     if (SIG_DEBUG === '1') {
-      const algo = sig?.split('=')[0] || 'none';
-      console.log('SigDebug:', { algo, len: raw.length, valid },
-        '\n body:', raw.toString('utf8').slice(0, 200).replace(/\s+/g, ' '));
+      console.log('SigDebug:', {
+        header: sigHeader,
+        ours256: `sha256=${ours256}`,
+        ours1:   `sha1=${ours1}`,
+        len: raw.length,
+        valid
+      }, '\n  body:', raw.toString('utf8').slice(0, 220).replace(/\s+/g, ' '));
     }
-    if (!valid) return res.sendStatus(401);
-    res.sendStatus(200);
 
-    // Handle payload
-    let body;
-    try { body = JSON.parse(raw.toString('utf8')); } catch { return; }
-    if (!Array.isArray(body.entry)) return;
+    if (TEMP_DISABLE_SIG !== '1' && !valid) return res.sendStatus(401);
+    if (TEMP_DISABLE_SIG === '1') console.log('⚠️ TEMP_DISABLE_SIG=1 — skipping signature verification');
 
-    for (const entry of body.entry) {
+    res.sendStatus(200); // ACK first
+
+    let payload; try { payload = JSON.parse(raw.toString('utf8')); } catch { return; }
+    if (!Array.isArray(payload.entry)) return;
+
+    for (const entry of payload.entry) {
       for (const change of entry.changes ?? []) {
         if (change.field === 'comments' && change.value?.id) {
           const commentId = change.value.id;
 
-          // 1) Get commenter IGSID
+          // 1) commenter IGSID
           let igsid = change.value?.from?.id || null;
-          if (!igsid) {
-            igsid = await fetchCommenterIgsid(commentId);
-          }
+          if (!igsid) igsid = await fetchCommenterIgsid(commentId);
+
           console.log('🧑‍💻 Commenter IGSID:', igsid || '(not found)');
 
-          // 2) Try to DM using the separate token
-          if (igsid) {
+          // 2) DM (requires Page token — IG token will NOT work for /me/messages)
+          if (igsid && DM_PAGE_ACCESS_TOKEN) {
             try {
-              await sendDmText(igsid, DM_MESSAGE_TEXT);
+              await sendDmText(igsid, DM_MESSAGE_TEXT, DM_PAGE_ACCESS_TOKEN);
               console.log('📩 DM sent to', igsid);
             } catch (e) {
               console.error('DM failed:', errorMsg(e));
             }
           }
 
-          // 3) Always send a private reply to the TOP-LEVEL comment (lands in their inbox)
+          // 3) Private reply to TOP-LEVEL comment (lands in inbox)
           try {
-            await privateReplyTop(commentId, AUTO_REPLY_MESSAGE);
+            await privateReplyTop(commentId, AUTO_REPLY_MESSAGE, PAGE_ACCESS_TOKEN);
             console.log('✉️ Private reply sent for', commentId);
           } catch (e) {
             console.error('Private reply failed:', errorMsg(e));
           }
         }
 
-        // If you also subscribed to messages: echo back or send carousel, etc.
         if (change.field === 'messages') {
           const msgs = change.value?.messages || [];
           for (const m of msgs) {
             const fromId = m?.from?.id;
-            const text = (m?.text || '').trim();
+            const text   = (m?.text || '').trim();
             console.log('📨 DM event:', { fromId, text });
-            if (fromId) {
-              try {
-                await sendDmText(fromId, 'Got it! Thanks for messaging us 🙌');
-              } catch (e) {
-                console.error('Reply DM failed:', errorMsg(e));
-              }
+            if (fromId && DM_PAGE_ACCESS_TOKEN) {
+              try { await sendDmText(fromId, 'Got it! 🙌', DM_PAGE_ACCESS_TOKEN); }
+              catch (e) { console.error('Reply DM failed:', errorMsg(e)); }
             }
           }
         }
@@ -136,44 +167,42 @@ app.post('/webhook', rawParser, async (req, res) => {
 app.listen(PORT, () => console.log(`🚀 http://localhost:${PORT}`));
 
 /* =================== Helpers =================== */
-function verifySig(headerSig, raw, secret) {
-  if (!secret || !headerSig || !raw) return false;
-  const [algo, theirs] = headerSig.split('=');
-  if (!algo || !theirs) return false;
-  let ours;
-  try { ours = crypto.createHmac(algo, secret).update(raw).digest('hex'); }
-  catch { ours = crypto.createHmac('sha256', secret).update(raw).digest('hex'); }
-  try { return crypto.timingSafeEqual(Buffer.from(theirs), Buffer.from(ours)); }
-  catch { return false; }
+function verifyWithDebug(header, raw, secret) {
+  if (!header || !secret || !raw) return { valid: false, ours256: '', ours1: '' };
+  const [algo, theirs] = String(header).split('=');
+  const ours256 = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+  const ours1   = crypto.createHmac('sha1',   secret).update(raw).digest('hex');
+
+  let valid = false;
+  try {
+    if (algo === 'sha256') valid = crypto.timingSafeEqual(Buffer.from(theirs), Buffer.from(ours256));
+    else if (algo === 'sha1') valid = crypto.timingSafeEqual(Buffer.from(theirs), Buffer.from(ours1));
+  } catch { valid = false; }
+  return { valid, ours256, ours1 };
 }
 
-/* Fetch commenter IGSID. Prefer webhook "from.id"; if absent, query the comment. */
+/* Fetch commenter IGSID if not in webhook */
 async function fetchCommenterIgsid(commentId) {
   const r = await axios.get(`https://graph.facebook.com/v23.0/${commentId}`, {
-    params: {
-      fields: 'from{id,username}',
-      access_token: PAGE_ACCESS_TOKEN
-    },
-    timeout: 30000,
-    validateStatus: () => true
+    params: { fields: 'from{id,username}', access_token: PAGE_ACCESS_TOKEN },
+    timeout: 30000, validateStatus: () => true
   });
   if (r.status >= 200 && r.status < 300) return r.data?.from?.id || null;
   console.error('fetchCommenterIgsid failed:', errorMsg({ response: r }));
   return null;
 }
 
-/* Private reply must go to the TOP-LEVEL comment */
-async function privateReplyTop(commentId, message) {
-  // Find parent_id (if this is a reply to a comment)
+/* Private reply must hit TOP-LEVEL comment */
+async function privateReplyTop(commentId, message, pageToken) {
   let targetId = commentId;
   const r = await axios.get(`https://graph.facebook.com/v23.0/${commentId}`, {
-    params: { fields: 'id,parent_id', access_token: PAGE_ACCESS_TOKEN },
+    params: { fields: 'id,parent_id', access_token: pageToken },
     timeout: 30000, validateStatus: () => true
   });
   if (r.status >= 200 && r.status < 300 && r.data?.parent_id) targetId = r.data.parent_id;
 
   const url  = `https://graph.facebook.com/v23.0/${targetId}/private_replies`;
-  const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
+  const body = new URLSearchParams({ message, access_token: pageToken });
   const pr = await axios.post(url, body.toString(), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     timeout: 30000, validateStatus: () => true
@@ -183,30 +212,20 @@ async function privateReplyTop(commentId, message) {
   }
 }
 
-/* Send a plain DM using the SEPARATE token you provided */
-async function sendDmText(igsid, text) {
-  const payload = {
-    recipient: { id: igsid },
-    messaging_type: 'RESPONSE',
-    message: { text }
-  };
-  const r = await axios.post(
-    'https://graph.facebook.com/v23.0/me/messages',
-    payload,
-    {
-      params: { access_token: DM_PAGE_ACCESS_TOKEN },
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000, validateStatus: () => true
-    }
-  );
+/* Send a plain DM (MUST use Page token, not IGA…) */
+async function sendDmText(igsid, text, pageToken) {
+  const payload = { recipient: { id: igsid }, messaging_type: 'RESPONSE', message: { text } };
+  const r = await axios.post('https://graph.facebook.com/v23.0/me/messages', payload, {
+    params: { access_token: pageToken },
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 30000, validateStatus: () => true
+  });
   if (r.status < 200 || r.status >= 300) {
     throw new Error(`HTTP ${r.status} ${r.statusText} — ${JSON.stringify(r.data)}`);
   }
 }
 
 function errorMsg(err) {
-  if (err?.response) {
-    return `HTTP ${err.response.status} ${err.response.statusText} — ${JSON.stringify(err.response.data)}`;
-  }
+  if (err?.response) return `HTTP ${err.response.status} ${err.response.statusText} — ${JSON.stringify(err.response.data)}`;
   return String(err?.message || err);
 }
