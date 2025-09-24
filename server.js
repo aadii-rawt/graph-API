@@ -5,19 +5,21 @@ const fetch = require('node-fetch'); // v2
 require('dotenv').config();
 
 const app = express();
-app.set('trust proxy', 1); // friendly with Render/NGINX/CDN
+app.set('trust proxy', 1);
 
 const {
   PORT = 3000,
   VERIFY_TOKEN,
   APP_SECRET,
   PAGE_ACCESS_TOKEN,
-  AUTO_REPLY_MESSAGE = 'Thanks for your comment! 🙌',
+  AUTO_REPLY_MESSAGE = 'Thanks for the comment! 🙌',
+  IG_BUSINESS_ID,
+  IG_USERNAME,                   // optional shortcut
   SIG_DEBUG = '0',
   TEMP_DISABLE_SIG = '0',
 } = process.env;
 
-// ---- allow everyone (no cors lib) ----
+// allow all origins (helpful for your tests; not needed for Meta)
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -26,15 +28,34 @@ app.use((req, res, next) => {
   next();
 });
 
-// Regular JSON only for non-webhook routes
 app.use('/health', express.json());
 app.use('/privacy-policy', express.json());
 app.use(morgan('tiny'));
 
-// -------- health --------
+// in-memory de-dupe of comment ids (avoid double replies on retries)
+const seenCommentIds = new Set();
+
+// resolve our own IG username (to avoid replying to ourselves)
+let SELF_USERNAME = IG_USERNAME || null;
+(async () => {
+  try {
+    if (!SELF_USERNAME && IG_BUSINESS_ID && PAGE_ACCESS_TOKEN) {
+      const r = await fetch(`https://graph.facebook.com/v23.0/${IG_BUSINESS_ID}?fields=username&access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`);
+      if (r.ok) {
+        const j = await r.json();
+        if (j.username) {
+          SELF_USERNAME = String(j.username);
+          console.log('👤 Detected IG username:', SELF_USERNAME);
+        }
+      }
+    }
+  } catch (_) {}
+})();
+
+// health
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ======== GET /webhook (verification + friendly page) ========
+// GET /webhook (Meta verify or friendly page)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -44,45 +65,41 @@ app.get('/webhook', (req, res) => {
     console.log('✅ Webhook verified');
     return res.status(200).send(challenge);
   }
-  // No verify params → show page like your screenshot
   return res.type('html').send(HELLO_HTML('GET'));
 });
 
-// ======== POST /webhook (use raw body for correct HMAC) ========
+// POST /webhook — use raw body so HMAC matches exactly
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
-    // Temporary bypass if you only want to see that Render receives the POST
     if (TEMP_DISABLE_SIG === '1') {
       if (SIG_DEBUG === '1') console.log('⚠️ TEMP_DISABLE_SIG=1 — skipping signature verification');
       res.status(200).send(HELLO_HTML('POST'));
-      safeProcessWebhook(req); // still print/process payload
+      safeProcessWebhook(req);
       return;
     }
 
-    // Meta sends one of these:
     const sig256 = req.get('x-hub-signature-256');
     const sig1 = req.get('x-hub-signature');
     const headerSig = sig256 || sig1;
-
     const rawBuf = req.body instanceof Buffer ? req.body : Buffer.from(req.body || '');
-    const contentType = (req.headers['content-type'] || '').toLowerCase();
-
     const valid = verifyMetaSignature(headerSig, rawBuf, APP_SECRET);
 
     if (SIG_DEBUG === '1') {
       const sample = rawBuf.toString('utf8').slice(0, 80).replace(/\s+/g, ' ');
-      console.log('🔎 SigDebug ->',
-        { algo: headerSig ? headerSig.split('=')[0] : 'none',
-          contentType, rawLen: rawBuf.length, valid });
+      console.log('🔎 SigDebug ->', {
+        algo: headerSig ? headerSig.split('=')[0] : 'none',
+        rawLen: rawBuf.length,
+        valid
+      });
       console.log('🔎 BodySample:', sample);
     }
 
     if (!APP_SECRET || !valid) {
       console.warn('❌ Invalid or missing signature on webhook POST');
-      return res.sendStatus(401); // Meta will retry; flip TEMP_DISABLE_SIG=1 to bypass
+      return res.sendStatus(401);
     }
 
-    // Ack quickly so Meta stops waiting
+    // Ack fast
     res.sendStatus(200);
 
     // Process after ack
@@ -93,12 +110,12 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   }
 });
 
-// -------- Privacy Policy --------
+// Privacy Policy page
 app.get('/privacy-policy', (_req, res) => {
   res.type('html').send(PRIVACY_POLICY_HTML());
 });
 
-// -------- Start --------
+// start
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
@@ -108,14 +125,13 @@ function verifyMetaSignature(headerSig, rawBodyBuf, appSecret) {
   if (!appSecret || !headerSig || !rawBodyBuf) return false;
   const parts = headerSig.split('=');
   if (parts.length !== 2) return false;
-  const algo = parts[0];          // "sha256" or "sha1"
+  const algo = parts[0]; // sha256 or sha1
   const theirHex = parts[1];
 
   let hmacHex;
   try {
     hmacHex = crypto.createHmac(algo, appSecret).update(rawBodyBuf).digest('hex');
   } catch {
-    // fallback to sha256 if something odd arrives
     hmacHex = crypto.createHmac('sha256', appSecret).update(rawBodyBuf).digest('hex');
   }
   try {
@@ -139,18 +155,49 @@ async function processWebhookBuffer(rawBuf) {
     for (const change of entry.changes || []) {
       if (change.field === 'comments' && change.value?.id) {
         const commentId = change.value.id;
-        const text = change.value?.text;
-        console.log('📝 New comment:', { commentId, text });
-
-        try {
-          await sendPrivateReply(commentId, process.env.AUTO_REPLY_MESSAGE || 'Thanks for your comment! 🙌');
-          console.log('📩 Private reply sent for comment', commentId);
-        } catch (err) {
-          console.error('Private reply failed:', await safeText(err));
+        // skip duplicates
+        if (seenCommentIds.has(commentId)) {
+          if (SIG_DEBUG === '1') console.log('↩️ already handled', commentId);
+          continue;
         }
+        seenCommentIds.add(commentId);
+
+        // who wrote it? (avoid replying to ourselves)
+        let author = change.value.username || null;
+        if (!author) {
+          try {
+            const r = await fetch(`https://graph.facebook.com/v23.0/${commentId}?fields=username&access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`);
+            if (r.ok) {
+              const j = await r.json();
+              author = j.username || null;
+            }
+          } catch (_) {}
+        }
+        if (author && SELF_USERNAME && author.toLowerCase() === SELF_USERNAME.toLowerCase()) {
+          if (SIG_DEBUG === '1') console.log('🛑 own comment; skipping reply');
+          continue;
+        }
+
+        const text = change.value?.text;
+        console.log('📝 New comment:', { commentId, author, text });
+
+        // === PUBLIC REPLY ===
+        try {
+          await sendPublicReply(commentId, AUTO_REPLY_MESSAGE);
+          console.log('💬 Public reply posted to', commentId);
+        } catch (err) {
+          console.error('Public reply failed:', await safeText(err));
+        }
+
+        // If you ALSO want a private reply DM, uncomment:
+        // try {
+        //   await sendPrivateReply(commentId, 'Thanks! I just DMed you details. ✉️');
+        // } catch (err) { console.error('Private reply failed:', await safeText(err)); }
       }
+
+      // (Optional) handle DMs if you subscribed to messages
       if (change.field === 'messages') {
-        console.log('💬 DM event:', JSON.stringify(change.value));
+        console.log('📨 DM event:', JSON.stringify(change.value));
       }
     }
   }
@@ -163,6 +210,14 @@ function safeProcessWebhook(req) {
   } catch (e) {
     console.error('safeProcessWebhook error:', e);
   }
+}
+
+async function sendPublicReply(commentId, message) {
+  // POST /{ig-comment-id}/replies
+  const url = `https://graph.facebook.com/v23.0/${commentId}/replies`;
+  const params = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
+  const r = await fetch(url, { method: 'POST', body: params });
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} — ${await r.text()}`);
 }
 
 async function sendPrivateReply(commentId, message) {
