@@ -9,7 +9,6 @@ const app = express();
 app.set('trust proxy', 1);
 
 /* =================== HARD-CODED IG (Basic Display) TOKEN =================== */
-/* Used ONLY for https://graph.instagram.com (Basic Display) endpoints */
 const IG_URL_ACCESS_TOKEN =
   'IGAAVVFmqvs4JBZAE5SWVlOZAC10QWVHYlZAyNTNNc3dOS3VkcUxGMUFCdHpMQ2hOTF9mWnB5UWZAFT0FhZAUlBZA3FxRWc2U0U4Tl81VDZAudEdQelhBcUVIcUNoSGgzdzh6ZATJqaVRPSnpxTnBFQUxyNjFGM0NINnNqeW9zbHAxS0FuQQZDZD';
 
@@ -18,8 +17,8 @@ const {
   PORT = 3000,
   VERIFY_TOKEN,
   APP_SECRET,
-  PAGE_ACCESS_TOKEN,          // read comments + private replies (graph.facebook.com)
-  DM_PAGE_ACCESS_TOKEN,       // send DMs (graph.facebook.com) — MUST be a Page token (EA…)
+  PAGE_ACCESS_TOKEN,          // read comments + private replies
+  DM_PAGE_ACCESS_TOKEN,       // default token to send DMs
   DM_MESSAGE_TEXT = 'Thanks for your comment! Check our catalog: https://example.com',
   AUTO_REPLY_MESSAGE = 'Thanks for the comment! We just messaged you. ✉️',
   SIG_DEBUG = '1',
@@ -35,8 +34,9 @@ app.use((req, res, next) => {
   next();
 });
 app.use(morgan('tiny'));
+app.use(express.json()); // for POST /send-dm
 
-/* RAW parser just for the webhook route */
+/* RAW parser only for the webhook route */
 const rawParser = express.raw({ type: '*/*', inflate: false, limit: '5mb' });
 
 /* =================== Health + Privacy =================== */
@@ -48,14 +48,23 @@ app.get('/privacy-policy', (_req, res) => {
   </body></html>`);
 });
 
-/* =================== DEBUG routes using your IGA… token =================== */
-/* These hit graph.instagram.com with the HARD-CODED token. Good for quick tests. */
+/* =================== DEBUG routes using IGA token =================== */
 app.get('/debug/basic-user', async (_req, res) => {
   try {
     const r = await axios.get('https://graph.instagram.com/v21.0/me', {
+      params: { fields: 'id,username,account_type,media_count', access_token: IG_URL_ACCESS_TOKEN }
+    });
+    res.status(r.status).json(r.data);
+  } catch (e) {
+    res.status(e?.response?.status || 500).json(e?.response?.data || { error: String(e) });
+  }
+});
+app.get('/debug/basic-media', async (_req, res) => {
+  try {
+    const r = await axios.get('https://graph.instagram.com/v21.0/me/media', {
       params: {
-        fields: 'id,username,account_type,media_count',
-        access_token: IG_URL_ACCESS_TOKEN
+        fields: 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp',
+        access_token: IG_URL_ACCESS_TOKEN, limit: 25
       }
     });
     res.status(r.status).json(r.data);
@@ -64,18 +73,15 @@ app.get('/debug/basic-user', async (_req, res) => {
   }
 });
 
-app.get('/debug/basic-media', async (_req, res) => {
+/* =================== QUICK TOKEN CHECK (Page token?) =================== */
+app.get('/debug/whoami', async (req, res) => {
+  const token = req.query.token || DM_PAGE_ACCESS_TOKEN;
+  if (!token) return res.status(400).json({ error: 'token required' });
   try {
-    const r = await axios.get('https://graph.instagram.com/v21.0/me/media', {
-      params: {
-        fields: 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp',
-        access_token: IG_URL_ACCESS_TOKEN,
-        limit: 25
-      }
-    });
-    res.status(r.status).json(r.data);
+    const r = await axios.get('https://graph.facebook.com/v23.0/me', { params: { access_token: token } });
+    res.json({ ok: true, me: r.data });
   } catch (e) {
-    res.status(e?.response?.status || 500).json(e?.response?.data || { error: String(e) });
+    res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data || String(e) });
   }
 });
 
@@ -124,7 +130,7 @@ app.post('/webhook', rawParser, async (req, res) => {
 
           console.log('🧑‍💻 Commenter IGSID:', igsid || '(not found)');
 
-          // 2) DM (requires Page token — IG token will NOT work for /me/messages)
+          // 2) DM (requires Page token)
           if (igsid && DM_PAGE_ACCESS_TOKEN) {
             try {
               await sendDmText(igsid, DM_MESSAGE_TEXT, DM_PAGE_ACCESS_TOKEN);
@@ -134,7 +140,7 @@ app.post('/webhook', rawParser, async (req, res) => {
             }
           }
 
-          // 3) Private reply to TOP-LEVEL comment (lands in inbox)
+          // 3) Private reply to TOP-LEVEL comment
           try {
             await privateReplyTop(commentId, AUTO_REPLY_MESSAGE, PAGE_ACCESS_TOKEN);
             console.log('✉️ Private reply sent for', commentId);
@@ -163,6 +169,48 @@ app.post('/webhook', rawParser, async (req, res) => {
   }
 });
 
+/* =================== NEW: manual “send DM” endpoints =================== */
+
+/** GET /send-dm?igsid=...&token=...&text=... 
+ *  - igsid: Instagram Scoped ID (e.g. 663105936766237)
+ *  - token: Page access token (if omitted, uses DM_PAGE_ACCESS_TOKEN)
+ *  - text : message text (optional; defaults to DM_MESSAGE_TEXT or sample)
+ */
+app.get('/send-dm', async (req, res) => {
+  const igsid = req.query.igsid;
+  const token = req.query.token || DM_PAGE_ACCESS_TOKEN;
+  const text  = req.query.text || DM_MESSAGE_TEXT || 'Hello from /send-dm 👋';
+
+  if (!igsid) return res.status(400).json({ ok: false, error: 'igsid required' });
+  if (!token) return res.status(400).json({ ok: false, error: 'token required (Page access token)' });
+
+  try {
+    const out = await sendDmText(igsid, text, token);
+    return res.json({ ok: true, sent_to: igsid, text, result: out });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: errorMsg(e) });
+  }
+});
+
+/** POST /send-dm
+ *  JSON: { "igsid": "...", "token": "...", "text": "..." }
+ */
+app.post('/send-dm', async (req, res) => {
+  const igsid = req.body.igsid;
+  const token = req.body.token || DM_PAGE_ACCESS_TOKEN;
+  const text  = req.body.text || DM_MESSAGE_TEXT || 'Hello from /send-dm 👋';
+
+  if (!igsid) return res.status(400).json({ ok: false, error: 'igsid required' });
+  if (!token) return res.status(400).json({ ok: false, error: 'token required (Page access token)' });
+
+  try {
+    const out = await sendDmText(igsid, text, token);
+    return res.json({ ok: true, sent_to: igsid, text, result: out });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: errorMsg(e) });
+  }
+});
+
 /* =================== Start =================== */
 app.listen(PORT, () => console.log(`🚀 http://localhost:${PORT}`));
 
@@ -172,7 +220,6 @@ function verifyWithDebug(header, raw, secret) {
   const [algo, theirs] = String(header).split('=');
   const ours256 = crypto.createHmac('sha256', secret).update(raw).digest('hex');
   const ours1   = crypto.createHmac('sha1',   secret).update(raw).digest('hex');
-
   let valid = false;
   try {
     if (algo === 'sha256') valid = crypto.timingSafeEqual(Buffer.from(theirs), Buffer.from(ours256));
@@ -181,7 +228,6 @@ function verifyWithDebug(header, raw, secret) {
   return { valid, ours256, ours1 };
 }
 
-/* Fetch commenter IGSID if not in webhook */
 async function fetchCommenterIgsid(commentId) {
   const r = await axios.get(`https://graph.facebook.com/v23.0/${commentId}`, {
     params: { fields: 'from{id,username}', access_token: PAGE_ACCESS_TOKEN },
@@ -192,7 +238,6 @@ async function fetchCommenterIgsid(commentId) {
   return null;
 }
 
-/* Private reply must hit TOP-LEVEL comment */
 async function privateReplyTop(commentId, message, pageToken) {
   let targetId = commentId;
   const r = await axios.get(`https://graph.facebook.com/v23.0/${commentId}`, {
@@ -207,12 +252,12 @@ async function privateReplyTop(commentId, message, pageToken) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     timeout: 30000, validateStatus: () => true
   });
-  if (pr.status < 200 || pr.status >= 300) {
+  if (pr.status < 200 || r.status >= 300) {
     throw new Error(`HTTP ${pr.status} ${pr.statusText} — ${JSON.stringify(pr.data)}`);
   }
 }
 
-/* Send a plain DM (MUST use Page token, not IGA…) */
+/* returns axios response.data so caller can include it in JSON */
 async function sendDmText(igsid, text, pageToken) {
   const payload = { recipient: { id: igsid }, messaging_type: 'RESPONSE', message: { text } };
   const r = await axios.post('https://graph.facebook.com/v23.0/me/messages', payload, {
@@ -223,6 +268,7 @@ async function sendDmText(igsid, text, pageToken) {
   if (r.status < 200 || r.status >= 300) {
     throw new Error(`HTTP ${r.status} ${r.statusText} — ${JSON.stringify(r.data)}`);
   }
+  return r.data;
 }
 
 function errorMsg(err) {
