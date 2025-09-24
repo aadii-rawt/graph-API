@@ -8,24 +8,24 @@ require('dotenv').config();
 const app = express();
 app.set('trust proxy', 1);
 
-/* =================== HARD-CODED IG (Basic Display) TOKEN =================== */
+/* ---------- HARD-CODED Basic Display token (read-only IG endpoints) ---------- */
 const IG_URL_ACCESS_TOKEN =
   'IGAAVVFmqvs4JBZAE5SWVlOZAC10QWVHYlZAyNTNNc3dOS3VkcUxGMUFCdHpMQ2hOTF9mWnB5UWZAFT0FhZAUlBZA3FxRWc2U0U4Tl81VDZAudEdQelhBcUVIcUNoSGgzdzh6ZATJqaVRPSnpxTnBFQUxyNjFGM0NINnNqeW9zbHAxS0FuQQZDZD';
 
-/* =================== ENV (Graph API / messaging) =================== */
+/* ---------- ENV (messaging / webhook) ---------- */
 const {
   PORT = 3000,
-  VERIFY_TOKEN,
-  APP_SECRET,
-  PAGE_ACCESS_TOKEN,          // read comments + private replies
-  DM_PAGE_ACCESS_TOKEN,       // default token to send DMs
-  DM_MESSAGE_TEXT = 'Thanks for your comment! Check our catalog: https://example.com',
+  VERIFY_TOKEN,              // webhook verify token (string you choose)
+  APP_SECRET,                // app secret (from Meta App → Basic settings)
+  PAGE_ACCESS_TOKEN,         // page token for comment/private replies (EA…)
+  DM_PAGE_ACCESS_TOKEN,      // page token to send DMs (EA…)
   AUTO_REPLY_MESSAGE = 'Thanks for the comment! We just messaged you. ✉️',
-  SIG_DEBUG = '1',
+  DM_MESSAGE_TEXT   = 'Thanks for your comment! Check our catalog: https://example.com',
+  SIG_DEBUG = '0',
   TEMP_DISABLE_SIG = '0',
 } = process.env;
 
-/* =================== Middleware =================== */
+/* ---------- Global middleware (no CORS lib; wide-open) ---------- */
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -34,21 +34,19 @@ app.use((req, res, next) => {
   next();
 });
 app.use(morgan('tiny'));
-app.use(express.json()); // for POST /send-dm
+app.use(express.json()); // for POST /send-dm JSON
 
-/* RAW parser only for the webhook route */
+/* Use RAW parser only for webhook so signature matches exactly */
 const rawParser = express.raw({ type: '*/*', inflate: false, limit: '5mb' });
 
-/* =================== Health + Privacy =================== */
+/* ---------- Health & Privacy ---------- */
 app.get('/health', (_req, res) => res.json({ ok: true }));
-app.get('/privacy-policy', (_req, res) => {
-  res.type('html').send(`<!doctype html><html><body>
-  <h1>Privacy Policy</h1>
+app.get('/privacy-policy', (_req, res) =>
+  res.type('html').send(`<!doctype html><html><body><h1>Privacy Policy</h1>
   <p>We use Instagram data you authorize to provide automated replies and messages.</p>
-  </body></html>`);
-});
+  </body></html>`));
 
-/* =================== DEBUG routes using IGA token =================== */
+/* ---------- Read-only debug using Basic Display token ---------- */
 app.get('/debug/basic-user', async (_req, res) => {
   try {
     const r = await axios.get('https://graph.instagram.com/v21.0/me', {
@@ -73,9 +71,9 @@ app.get('/debug/basic-media', async (_req, res) => {
   }
 });
 
-/* =================== QUICK TOKEN CHECK (Page token?) =================== */
+/* ---------- Quick token sanity check (should return your Page) ---------- */
 app.get('/debug/whoami', async (req, res) => {
-  const token = req.query.token || DM_PAGE_ACCESS_TOKEN;
+  const token = req.query.token || DM_PAGE_ACCESS_TOKEN || PAGE_ACCESS_TOKEN;
   if (!token) return res.status(400).json({ error: 'token required' });
   try {
     const r = await axios.get('https://graph.facebook.com/v23.0/me', { params: { access_token: token } });
@@ -85,7 +83,7 @@ app.get('/debug/whoami', async (req, res) => {
   }
 });
 
-/* =================== Webhook verify (GET) =================== */
+/* ---------- Webhook verify (GET) ---------- */
 app.get('/webhook', (req, res) => {
   const mode      = req.query['hub.mode'];
   const token     = req.query['hub.verify_token'];
@@ -94,7 +92,7 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-/* =================== Webhook receive (POST) =================== */
+/* ---------- Webhook receive (POST) ---------- */
 app.post('/webhook', rawParser, async (req, res) => {
   try {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
@@ -108,7 +106,7 @@ app.post('/webhook', rawParser, async (req, res) => {
         ours1:   `sha1=${ours1}`,
         len: raw.length,
         valid
-      }, '\n  body:', raw.toString('utf8').slice(0, 220).replace(/\s+/g, ' '));
+      }, '\n  body:', raw.toString('utf8').slice(0, 240).replace(/\s+/g, ' '));
     }
 
     if (TEMP_DISABLE_SIG !== '1' && !valid) return res.sendStatus(401);
@@ -124,7 +122,7 @@ app.post('/webhook', rawParser, async (req, res) => {
         if (change.field === 'comments' && change.value?.id) {
           const commentId = change.value.id;
 
-          // 1) commenter IGSID
+          // 1) commenter IGSID (prefer webhook value; fallback to fetch)
           let igsid = change.value?.from?.id || null;
           if (!igsid) igsid = await fetchCommenterIgsid(commentId);
 
@@ -140,7 +138,7 @@ app.post('/webhook', rawParser, async (req, res) => {
             }
           }
 
-          // 3) Private reply to TOP-LEVEL comment
+          // 3) Private reply to TOP-LEVEL comment (lands in their inbox)
           try {
             await privateReplyTop(commentId, AUTO_REPLY_MESSAGE, PAGE_ACCESS_TOKEN);
             console.log('✉️ Private reply sent for', commentId);
@@ -169,49 +167,38 @@ app.post('/webhook', rawParser, async (req, res) => {
   }
 });
 
-/* =================== NEW: manual “send DM” endpoints =================== */
-
-/** GET /send-dm?igsid=...&token=...&text=... 
- *  - igsid: Instagram Scoped ID (e.g. 663105936766237)
- *  - token: Page access token (if omitted, uses DM_PAGE_ACCESS_TOKEN)
- *  - text : message text (optional; defaults to DM_MESSAGE_TEXT or sample)
- */
+/* ---------- Manual DM endpoints (by route) ---------- */
+/* GET /send-dm?igsid=663105936766237&token=<PAGE_TOKEN>&text=Hello */
 app.get('/send-dm', async (req, res) => {
   const igsid = req.query.igsid;
-  const token = req.query.token || DM_PAGE_ACCESS_TOKEN;
-  const text  = req.query.text || DM_MESSAGE_TEXT || 'Hello from /send-dm 👋';
-
+  const token = req.query.token || DM_PAGE_ACCESS_TOKEN || PAGE_ACCESS_TOKEN;
+  const text  = req.query.text || DM_MESSAGE_TEXT || 'Hello 👋';
   if (!igsid) return res.status(400).json({ ok: false, error: 'igsid required' });
   if (!token) return res.status(400).json({ ok: false, error: 'token required (Page access token)' });
-
   try {
     const out = await sendDmText(igsid, text, token);
-    return res.json({ ok: true, sent_to: igsid, text, result: out });
+    res.json({ ok: true, sent_to: igsid, text, result: out });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: errorMsg(e) });
+    res.status(500).json({ ok: false, error: errorMsg(e) });
   }
 });
 
-/** POST /send-dm
- *  JSON: { "igsid": "...", "token": "...", "text": "..." }
- */
+/* POST /send-dm  { "igsid":"...", "token":"<PAGE_TOKEN>", "text":"..." } */
 app.post('/send-dm', async (req, res) => {
   const igsid = req.body.igsid;
-  const token = req.body.token || DM_PAGE_ACCESS_TOKEN;
-  const text  = req.body.text || DM_MESSAGE_TEXT || 'Hello from /send-dm 👋';
-
+  const token = req.body.token || DM_PAGE_ACCESS_TOKEN || PAGE_ACCESS_TOKEN;
+  const text  = req.body.text || DM_MESSAGE_TEXT || 'Hello 👋';
   if (!igsid) return res.status(400).json({ ok: false, error: 'igsid required' });
   if (!token) return res.status(400).json({ ok: false, error: 'token required (Page access token)' });
-
   try {
     const out = await sendDmText(igsid, text, token);
-    return res.json({ ok: true, sent_to: igsid, text, result: out });
+    res.json({ ok: true, sent_to: igsid, text, result: out });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: errorMsg(e) });
+    res.status(500).json({ ok: false, error: errorMsg(e) });
   }
 });
 
-/* =================== Start =================== */
+/* ---------- Start ---------- */
 app.listen(PORT, () => console.log(`🚀 http://localhost:${PORT}`));
 
 /* =================== Helpers =================== */
@@ -252,16 +239,15 @@ async function privateReplyTop(commentId, message, pageToken) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     timeout: 30000, validateStatus: () => true
   });
-  if (pr.status < 200 || r.status >= 300) {
+  if (pr.status < 200 || pr.status >= 300) {
     throw new Error(`HTTP ${pr.status} ${pr.statusText} — ${JSON.stringify(pr.data)}`);
   }
 }
 
-/* returns axios response.data so caller can include it in JSON */
 async function sendDmText(igsid, text, pageToken) {
   const payload = { recipient: { id: igsid }, messaging_type: 'RESPONSE', message: { text } };
-  const r = await axios.post('https://graph.facebook.com/v23.0/me/messages', payload, {
-    params: { access_token: pageToken },
+  const r = await axios.post('https://graph.instagram.com/v23.0/me/messages', payload, {
+    params: { access_token: "Bearer IGAAVVFmqvs4JBZAE5SWVlOZAC10QWVHYlZAyNTNNc3dOS3VkcUxGMUFCdHpMQ2hOTF9mWnB5UWZAFT0FhZAUlBZA3FxRWc2U0U4Tl81VDZAudEdQelhBcUVIcUNoSGgzdzh6ZATJqaVRPSnpxTnBFQUxyNjFGM0NINnNqeW9zbHAxS0FuQQZDZD" },
     headers: { 'Content-Type': 'application/json' },
     timeout: 30000, validateStatus: () => true
   });
