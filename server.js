@@ -18,10 +18,10 @@ const {
   IG_BUSINESS_ID,
   IG_USERNAME,
   SIG_DEBUG = '0',
-  TEMP_DISABLE_SIG = '0'
+  TEMP_DISABLE_SIG = '0',
 } = process.env;
 
-// allow all origins (not required for Meta -> server, but handy for manual checks)
+// ---- allow all origins (handy for manual checks) ----
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -34,7 +34,10 @@ app.use('/health', express.json());
 app.use('/privacy-policy', express.json());
 app.use(morgan('tiny'));
 
-// optional: detect our own IG username (not required)
+// Root page (avoid GET / 404)
+app.get('/', (_req, res) => res.type('html').send(helloHTML('GET')));
+
+// Optional: detect our own IG username (not required)
 let SELF_USERNAME = IG_USERNAME || null;
 (async () => {
   try {
@@ -122,30 +125,32 @@ async function processPayload(rawBuf) {
 
   for (const entry of body.entry) {
     for (const change of entry.changes || []) {
-      // ----- New comment: 1) send private reply with CTA -----
+      // ----- New comment: try PRIVATE reply (top-level), else PUBLIC reply -----
       if (change.field === 'comments' && change.value?.id) {
         const commentId = change.value.id;
 
         try {
-          await sendPrivateReply(commentId, AUTO_REPLY_MESSAGE);
+          await sendPrivateReplySmart(commentId, AUTO_REPLY_MESSAGE);
           console.log('✉️ Private reply sent for', commentId);
         } catch (err) {
-          console.error('Private reply failed:', errMessage(err));
+          console.error('Private reply failed (will fall back to public):', errMessage(err));
+          try {
+            await sendPublicReply(commentId, AUTO_REPLY_MESSAGE);
+            console.log('💬 Public reply posted to', commentId);
+          } catch (e2) {
+            console.error('Public reply also failed:', errMessage(e2));
+          }
         }
       }
 
-      // ----- Incoming DM: 2) send the carousel -----
+      // ----- Incoming DM: send the carousel -----
       if (change.field === 'messages') {
-        // Instagram sends an array of messages in change.value.messages (shape varies slightly by account)
         const msgs = change.value?.messages || [];
         for (const m of msgs) {
           const fromId = m?.from?.id;
           const text = (m?.text || '').trim().toLowerCase();
-
-          // ignore our own messages
           if (fromId && IG_BUSINESS_ID && String(fromId) === String(IG_BUSINESS_ID)) continue;
 
-          // If they reply anything (or specifically "view") send the carousel.
           if (fromId && (text || m?.attachments)) {
             try {
               await sendCarousel(fromId);
@@ -169,9 +174,27 @@ function safeProcessWebhook(req) {
   }
 }
 
-// --- API calls ---
-async function sendPrivateReply(commentId, message) {
-  const url = `https://graph.facebook.com/v23.0/${commentId}/private_replies`;
+/** Read a comment; if it's a reply, target the TOP-LEVEL comment for private_replies */
+async function sendPrivateReplySmart(commentId, message) {
+  let targetId = commentId;
+  // 1) Find parent_id (if present, we must private-reply on the parent/top-level)
+  const { data } = await axios.get(
+    `https://graph.facebook.com/v23.0/${commentId}`,
+    { params: { fields: 'id,parent_id', access_token: PAGE_ACCESS_TOKEN } }
+  );
+  if (data?.parent_id) targetId = data.parent_id;
+
+  // 2) Private reply
+  const url = `https://graph.facebook.com/v23.0/${targetId}/private_replies`;
+  const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
+  await axios.post(url, body.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+}
+
+/** Public reply (always allowed on your own media) */
+async function sendPublicReply(commentId, message) {
+  // If it’s a reply, replying to the reply is fine publicly. If you want to always reply to top-level publicly:
+  // first read parent_id like in sendPrivateReplySmart and use parent if needed.
+  const url = `https://graph.facebook.com/v23.0/${commentId}/replies`;
   const body = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
   await axios.post(url, body.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
 }
@@ -189,7 +212,7 @@ async function sendCarousel(recipientId) {
             {
               title: 'Browse our products',
               subtitle: 'Tap below to view the full catalog',
-              image_url: CAROUSEL_IMAGE_URL || CATALOG_URL, // fallback if no image
+              image_url: CAROUSEL_IMAGE_URL || CATALOG_URL,
               default_action: { type: 'web_url', url: CATALOG_URL },
               buttons: [{ type: 'web_url', url: CATALOG_URL, title: 'View all products' }]
             }
