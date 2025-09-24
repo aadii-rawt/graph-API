@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const morgan = require('morgan');
 const crypto = require('crypto');
@@ -13,66 +14,71 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const AUTO_REPLY_MESSAGE =
   process.env.AUTO_REPLY_MESSAGE || 'Thanks for your comment! 😊';
 
-// ---- allow ALL origins (no cors package) ----
+// ---- allow ALL origins (no cors pkg) ----
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // everyone
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  // echo requested headers or allow any
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    req.header('Access-Control-Request-Headers') || '*'
-  );
+  res.setHeader('Access-Control-Allow-Headers', req.header('Access-Control-Request-Headers') || '*');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// keep raw body for Meta signature verification
-app.use(
-  express.json({
-    verify: (req, _res, buf) => {
-      req.rawBody = buf;
-    },
-  })
-);
-
+// keep raw body for signature verification
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
 app.use(morgan('tiny'));
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// --- Webhook verify (GET)
+// === GET /webhook ===
+// - If Meta verification params are present: return hub.challenge (required)
+// - Otherwise: show a friendly HTML page like your screenshot
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+  if (mode === 'subscribe' && token === VERIFY_TOKEN && challenge) {
     console.log('✅ Webhook verified');
     return res.status(200).send(challenge);
   }
-  console.warn('❌ Webhook verify failed');
-  return res.sendStatus(403);
+
+  // No verification params -> show demo page
+  return res
+    .type('html')
+    .send(HELLO_HTML('GET'));
 });
 
-// --- Webhook receive (POST)
+// === POST /webhook ===
+// - For real webhook calls (Meta sets signature): verify & ack 200; process events
+// - For manual tests, call /webhook?test=1 and we’ll show the POST demo page
 app.post('/webhook', async (req, res) => {
   try {
-    // verify x-hub-signature-256
-    if (APP_SECRET) {
-      const headerSig = req.get('x-hub-signature-256');
-      if (!isValidSignature(headerSig, req.rawBody, APP_SECRET)) {
-        console.warn('❌ Invalid signature');
+    const isTest = req.query.test === '1';
+
+    const sig = req.get('x-hub-signature-256');
+    const validSig = sig && isValidSignature(sig, req.rawBody, APP_SECRET);
+
+    if (!isTest) {
+      // production path: must have valid signature
+      if (!APP_SECRET || !validSig) {
+        console.warn('❌ Invalid or missing signature on webhook POST');
         return res.sendStatus(401);
       }
+      // ack fast
+      res.sendStatus(200);
+    } else {
+      // manual/browser test -> show the same kind of page
+      return res.type('html').send(HELLO_HTML('POST'));
     }
 
-    // ack fast
-    res.sendStatus(200);
-
+    // ----- process Meta payload (async, after ack) -----
     const body = req.body;
     if (!body?.object || !Array.isArray(body.entry)) return;
 
-    body.entry.forEach((entry) => {
-      (entry.changes || []).forEach(async (change) => {
+    for (const entry of body.entry) {
+      for (const change of entry.changes ?? []) {
         if (change.field === 'comments' && change.value?.id) {
           const commentId = change.value.id;
           const text = change.value?.text;
@@ -88,14 +94,14 @@ app.post('/webhook', async (req, res) => {
         if (change.field === 'messages') {
           console.log('💬 DM event:', JSON.stringify(change.value));
         }
-      });
-    });
+      }
+    }
   } catch (err) {
     console.error('Webhook handler error:', err);
   }
 });
 
-// --- Privacy Policy
+// Simple privacy policy page
 app.get('/privacy-policy', (_req, res) => {
   res.type('html').send(PRIVACY_POLICY_HTML());
 });
@@ -104,9 +110,9 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
 
-// helpers
+// ===== Helpers =====
 function isValidSignature(headerSig, rawBody, appSecret) {
-  if (!headerSig || !headerSig.startsWith('sha256=')) return false;
+  if (!appSecret || !headerSig || !headerSig.startsWith('sha256=')) return false;
   const their = headerSig.slice('sha256='.length);
   const expected = crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
   try {
@@ -117,17 +123,30 @@ function isValidSignature(headerSig, rawBody, appSecret) {
 }
 
 async function sendPrivateReply(commentId, message) {
+  // Allowed once per comment within 7 days (Meta policy)
   const url = `https://graph.facebook.com/v23.0/${commentId}/private_replies`;
-  const params = new URLSearchParams({
-    message,
-    access_token: PAGE_ACCESS_TOKEN,
-  });
+  const params = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
   const r = await fetch(url, { method: 'POST', body: params });
   if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} — ${await r.text()}`);
 }
 
 async function safeText(err) {
   try { return err?.stack?.toString() || String(err); } catch { return 'Unknown error'; }
+}
+
+// HTML used for your "Hello Webhook!" preview page
+function HELLO_HTML(method) {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Webhook ${method} Demo</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px}
+  h1{font-size:28px;font-weight:600}
+</style>
+</head>
+<body>
+  <h1>This is ${method} Request, Hello Webhook!</h1>
+</body></html>`;
 }
 
 function PRIVACY_POLICY_HTML() {
