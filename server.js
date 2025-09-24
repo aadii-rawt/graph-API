@@ -1,7 +1,7 @@
 const express = require('express');
 const morgan = require('morgan');
 const crypto = require('crypto');
-const fetch = require('node-fetch'); // v2
+const axios = require('axios');           // <-- use axios
 require('dotenv').config();
 
 const app = express();
@@ -14,12 +14,12 @@ const {
   PAGE_ACCESS_TOKEN,
   AUTO_REPLY_MESSAGE = 'Thanks for the comment! 🙌',
   IG_BUSINESS_ID,
-  IG_USERNAME,                   // optional shortcut
+  IG_USERNAME,
   SIG_DEBUG = '0',
   TEMP_DISABLE_SIG = '0',
 } = process.env;
 
-// allow all origins (helpful for your tests; not needed for Meta)
+// Open CORS (not required for Meta → server-to-server)
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -32,30 +32,29 @@ app.use('/health', express.json());
 app.use('/privacy-policy', express.json());
 app.use(morgan('tiny'));
 
-// in-memory de-dupe of comment ids (avoid double replies on retries)
 const seenCommentIds = new Set();
 
-// resolve our own IG username (to avoid replying to ourselves)
+// Resolve own IG username (so we don't reply to ourselves)
 let SELF_USERNAME = IG_USERNAME || null;
 (async () => {
   try {
     if (!SELF_USERNAME && IG_BUSINESS_ID && PAGE_ACCESS_TOKEN) {
-      const r = await fetch(`https://graph.facebook.com/v23.0/${IG_BUSINESS_ID}?fields=username&access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`);
-      if (r.ok) {
-        const j = await r.json();
-        if (j.username) {
-          SELF_USERNAME = String(j.username);
-          console.log('👤 Detected IG username:', SELF_USERNAME);
-        }
+      const { data } = await axios.get(
+        `https://graph.facebook.com/v23.0/${IG_BUSINESS_ID}`,
+        { params: { fields: 'username', access_token: PAGE_ACCESS_TOKEN } }
+      );
+      if (data?.username) {
+        SELF_USERNAME = String(data.username);
+        console.log('👤 Detected IG username:', SELF_USERNAME);
       }
     }
   } catch (_) {}
 })();
 
-// health
+// Health
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// GET /webhook (Meta verify or friendly page)
+// Verify webhook (GET)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -68,7 +67,7 @@ app.get('/webhook', (req, res) => {
   return res.type('html').send(HELLO_HTML('GET'));
 });
 
-// POST /webhook — use raw body so HMAC matches exactly
+// Receive webhook (POST) — raw so signature matches
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     if (TEMP_DISABLE_SIG === '1') {
@@ -89,7 +88,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
       console.log('🔎 SigDebug ->', {
         algo: headerSig ? headerSig.split('=')[0] : 'none',
         rawLen: rawBuf.length,
-        valid
+        valid,
       });
       console.log('🔎 BodySample:', sample);
     }
@@ -99,10 +98,7 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
       return res.sendStatus(401);
     }
 
-    // Ack fast
     res.sendStatus(200);
-
-    // Process after ack
     await processWebhookBuffer(rawBuf);
   } catch (err) {
     console.error('Webhook handler error:', err);
@@ -110,22 +106,21 @@ app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   }
 });
 
-// Privacy Policy page
+// Privacy policy
 app.get('/privacy-policy', (_req, res) => {
   res.type('html').send(PRIVACY_POLICY_HTML());
 });
 
-// start
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
 
-// ================= Helpers =================
+// ===== Helpers =====
 function verifyMetaSignature(headerSig, rawBodyBuf, appSecret) {
   if (!appSecret || !headerSig || !rawBodyBuf) return false;
   const parts = headerSig.split('=');
   if (parts.length !== 2) return false;
-  const algo = parts[0]; // sha256 or sha1
+  const algo = parts[0];          // 'sha256' or 'sha1'
   const theirHex = parts[1];
 
   let hmacHex;
@@ -155,22 +150,21 @@ async function processWebhookBuffer(rawBuf) {
     for (const change of entry.changes || []) {
       if (change.field === 'comments' && change.value?.id) {
         const commentId = change.value.id;
-        // skip duplicates
         if (seenCommentIds.has(commentId)) {
           if (SIG_DEBUG === '1') console.log('↩️ already handled', commentId);
           continue;
         }
         seenCommentIds.add(commentId);
 
-        // who wrote it? (avoid replying to ourselves)
+        // avoid replying to ourselves
         let author = change.value.username || null;
         if (!author) {
           try {
-            const r = await fetch(`https://graph.facebook.com/v23.0/${commentId}?fields=username&access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`);
-            if (r.ok) {
-              const j = await r.json();
-              author = j.username || null;
-            }
+            const { data } = await axios.get(
+              `https://graph.facebook.com/v23.0/${commentId}`,
+              { params: { fields: 'username', access_token: PAGE_ACCESS_TOKEN } }
+            );
+            author = data?.username || null;
           } catch (_) {}
         }
         if (author && SELF_USERNAME && author.toLowerCase() === SELF_USERNAME.toLowerCase()) {
@@ -186,16 +180,14 @@ async function processWebhookBuffer(rawBuf) {
           await sendPublicReply(commentId, AUTO_REPLY_MESSAGE);
           console.log('💬 Public reply posted to', commentId);
         } catch (err) {
-          console.error('Public reply failed:', await safeText(err));
+          console.error('Public reply failed:', errorMessage(err));
         }
 
         // If you ALSO want a private reply DM, uncomment:
-        // try {
-        //   await sendPrivateReply(commentId, 'Thanks! I just DMed you details. ✉️');
-        // } catch (err) { console.error('Private reply failed:', await safeText(err)); }
+        // try { await sendPrivateReply(commentId, 'Thanks! I just DMed you details. ✉️'); }
+        // catch (err) { console.error('Private reply failed:', errorMessage(err)); }
       }
 
-      // (Optional) handle DMs if you subscribed to messages
       if (change.field === 'messages') {
         console.log('📨 DM event:', JSON.stringify(change.value));
       }
@@ -215,20 +207,31 @@ function safeProcessWebhook(req) {
 async function sendPublicReply(commentId, message) {
   // POST /{ig-comment-id}/replies
   const url = `https://graph.facebook.com/v23.0/${commentId}/replies`;
-  const params = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
-  const r = await fetch(url, { method: 'POST', body: params });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} — ${await r.text()}`);
+  const body = new URLSearchParams({
+    message,
+    access_token: PAGE_ACCESS_TOKEN,
+  });
+  await axios.post(url, body.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
 }
 
 async function sendPrivateReply(commentId, message) {
   const url = `https://graph.facebook.com/v23.0/${commentId}/private_replies`;
-  const params = new URLSearchParams({ message, access_token: PAGE_ACCESS_TOKEN });
-  const r = await fetch(url, { method: 'POST', body: params });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} — ${await r.text()}`);
+  const body = new URLSearchParams({
+    message,
+    access_token: PAGE_ACCESS_TOKEN,
+  });
+  await axios.post(url, body.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
 }
 
-async function safeText(err) {
-  try { return err?.stack?.toString() || String(err); } catch { return 'Unknown error'; }
+function errorMessage(err) {
+  if (err?.response) {
+    return `HTTP ${err.response.status} ${err.response.statusText} — ${JSON.stringify(err.response.data)}`;
+  }
+  return String(err?.message || err);
 }
 
 function HELLO_HTML(method) {
