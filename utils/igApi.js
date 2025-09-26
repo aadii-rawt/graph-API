@@ -3,12 +3,13 @@
 const axios = require("axios");
 
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+if (!PAGE_ACCESS_TOKEN) {
+  console.warn("[igApi] PAGE_ACCESS_TOKEN is missing in .env");
+}
+
 let CACHED_PAGE_ID = process.env.PAGE_ID || null;
 
-/**
- * Resolve the Page ID once (if not provided via .env).
- * Uses the Page Access Token to call /me (which returns the Page profile).
- */
+/** Resolve and cache the Page ID (if not provided via .env) */
 async function getPageId() {
   if (CACHED_PAGE_ID) return CACHED_PAGE_ID;
   if (!PAGE_ACCESS_TOKEN) throw new Error("PAGE_ACCESS_TOKEN is missing");
@@ -19,42 +20,47 @@ async function getPageId() {
     validateStatus: () => true,
   });
   if (r.status < 200 || r.status >= 300) {
-    throw new Error(`Failed to resolve PAGE_ID: ${r.status} ${JSON.stringify(r.data)}`);
+    throw new Error(
+      `Failed to resolve PAGE_ID: ${r.status} ${JSON.stringify(r.data)}`
+    );
   }
   CACHED_PAGE_ID = r.data?.id;
-  if (!CACHED_PAGE_ID) throw new Error("Could not read Page id from /me response");
+  if (!CACHED_PAGE_ID) throw new Error("No Page id in /me response");
   return CACHED_PAGE_ID;
 }
 
 /**
- * Send a Private Reply to a specific comment.
- * Allowed once per comment within 7 days.
- * @param {string} commentId
- * @param {string} message
+ * ✅ Instagram PRIVATE REPLY (one message per comment within 7 days)
+ * POST https://graph.facebook.com/v21.0/{commentId}/private_replies
  */
 async function sendPrivateReply(commentId, message) {
+  if (!commentId) throw new Error("sendPrivateReply: missing commentId");
   if (!PAGE_ACCESS_TOKEN) throw new Error("PAGE_ACCESS_TOKEN is missing");
+
   const url = `https://graph.facebook.com/v21.0/${commentId}/private_replies`;
   const r = await axios.post(
     url,
-    { message },
+    { message }, // IG expects { message: "text" }
     {
-      params: { access_token: PAGE_ACCESS_TOKEN },
+      // You can also use params: { access_token: PAGE_ACCESS_TOKEN }
+      headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}` },
       timeout: 15000,
       validateStatus: () => true,
     }
   );
+
   if (r.status >= 200 && r.status < 300) return r.data;
   throw new Error(`Private reply failed ${r.status}: ${JSON.stringify(r.data)}`);
 }
 
 /**
- * Send a plain text Instagram DM (requires that you’re within policy window).
- * @param {string} igUserId PSID from webhook/message context
- * @param {string} text
+ * Optional: plain-text Instagram DM (use AFTER user replies in DM).
+ * POST https://graph.facebook.com/v21.0/{PAGE_ID}/messages
  */
 async function sendTextDM(igUserId, text) {
+  if (!igUserId) throw new Error("sendTextDM: missing igUserId");
   if (!PAGE_ACCESS_TOKEN) throw new Error("PAGE_ACCESS_TOKEN is missing");
+
   const PAGE_ID = await getPageId();
   const url = `https://graph.facebook.com/v21.0/${PAGE_ID}/messages`;
   const payload = {
@@ -63,7 +69,7 @@ async function sendTextDM(igUserId, text) {
     message: { text },
   };
   const r = await axios.post(url, payload, {
-    params: { access_token: PAGE_ACCESS_TOKEN },
+    headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}` },
     timeout: 20000,
     validateStatus: () => true,
   });
@@ -72,12 +78,14 @@ async function sendTextDM(igUserId, text) {
 }
 
 /**
- * Send a carousel (Generic Template) DM (max 10 cards).
- * @param {string} igUserId
- * @param {Array<object>} elements Messenger "generic" elements
+ * Optional: carousel/generic template DM (max 10 cards).
  */
 async function sendCarouselDM(igUserId, elements) {
+  if (!igUserId) throw new Error("sendCarouselDM: missing igUserId");
+  if (!Array.isArray(elements) || !elements.length)
+    throw new Error("sendCarouselDM: elements must be a non-empty array");
   if (!PAGE_ACCESS_TOKEN) throw new Error("PAGE_ACCESS_TOKEN is missing");
+
   const PAGE_ID = await getPageId();
   const url = `https://graph.facebook.com/v21.0/${PAGE_ID}/messages`;
   const payload = {
@@ -86,15 +94,12 @@ async function sendCarouselDM(igUserId, elements) {
     message: {
       attachment: {
         type: "template",
-        payload: {
-          template_type: "generic",
-          elements, // up to 10
-        },
+        payload: { template_type: "generic", elements },
       },
     },
   };
   const r = await axios.post(url, payload, {
-    params: { access_token: PAGE_ACCESS_TOKEN },
+    headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}` },
     timeout: 20000,
     validateStatus: () => true,
   });
@@ -102,14 +107,11 @@ async function sendCarouselDM(igUserId, elements) {
   throw new Error(`DM carousel failed ${r.status}: ${JSON.stringify(r.data)}`);
 }
 
-/**
- * Resolve a business media permalink from a business media id.
- * Useful to bridge Basic Display IDs vs Business webhook IDs.
- * @param {string} mediaId
- * @returns {Promise<string|null>}
- */
+/** Resolve a business media permalink from a business media id (handy for matching) */
 async function getBusinessMediaPermalink(mediaId) {
+  if (!mediaId) throw new Error("getBusinessMediaPermalink: missing mediaId");
   if (!PAGE_ACCESS_TOKEN) throw new Error("PAGE_ACCESS_TOKEN is missing");
+
   const url = `https://graph.facebook.com/v21.0/${mediaId}`;
   const r = await axios.get(url, {
     params: { access_token: PAGE_ACCESS_TOKEN, fields: "permalink" },
@@ -117,15 +119,12 @@ async function getBusinessMediaPermalink(mediaId) {
     validateStatus: () => true,
   });
   if (r.status >= 200 && r.status < 300) return r.data?.permalink || null;
-  throw new Error(`getBusinessMediaPermalink failed ${r.status}: ${JSON.stringify(r.data)}`);
+  throw new Error(
+    `getBusinessMediaPermalink failed ${r.status}: ${JSON.stringify(r.data)}`
+  );
 }
 
-/**
- * Map your Automation doc to Messenger "generic" template elements
- * (used for carousel DMs).
- * - If explicit carousel items exist, use them.
- * - Else convert `links` into simple cards.
- */
+/** Map your automation to Messenger "generic" template elements */
 function toGenericElements(automation) {
   if (!automation?.carousel?.length && !automation?.links?.length) return null;
 
@@ -151,9 +150,9 @@ function toGenericElements(automation) {
 
 module.exports = {
   getPageId,
-  sendPrivateReply,
-  sendTextDM,
-  sendCarouselDM,
+  sendPrivateReply,     // <-- use THIS in your controller first
+  sendTextDM,           // <-- use after user replies in DM (24h window)
+  sendCarouselDM,       // optional
   getBusinessMediaPermalink,
   toGenericElements,
 };
