@@ -9,9 +9,7 @@ const app = express();
 app.set('trust proxy', 1);
 
 /* ---------- HARD-CODED Basic Display token (read-only IG endpoints) ---------- */
-const IG_URL_ACCESS_TOKEN =
-  'IGAAVVFmqvs4JBZAE5SWVlOZAC10QWVHYlZAyNTNNc3dOS3VkcUxGMUFCdHpMQ2hOTF9mWnB5UWZAFT0FhZAUlBZA3FxRWc2U0U4Tl81VDZAudEdQelhBcUVIcUNoSGgzdzh6ZATJqaVRPSnpxTnBFQUxyNjFGM0NINnNqeW9zbHAxS0FuQQZDZD';
-
+const IG_URL_ACCESS_TOKEN = process.env.IG_BASIC_TOKEN
 /* ---------- ENV (messaging / webhook) ---------- */
 const {
   PORT = 3000,
